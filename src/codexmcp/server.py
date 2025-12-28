@@ -27,6 +27,11 @@ def _empty_str_to_none(value: str | None) -> str | None:
     return value
 
 
+def _env_truthy(name: str) -> bool:
+    value = os.getenv(name, "").strip().lower()
+    return value in {"1", "true", "yes", "on"}
+
+
 def run_shell_command(cmd: list[str]) -> Generator[str, None, None]:
     """Execute a command and stream its output line-by-line.
 
@@ -234,6 +239,9 @@ async def codex(
     ctx: Context | None = None,
 ) -> Dict[str, Any]:
     """Execute a Codex CLI session and return the results."""
+    if _env_truthy("CODEXMCP_RETURN_ALL_MESSAGES"):
+        return_all_messages = True
+
     # Build command as list to avoid injection
     cmd = ["codex", "exec", "--sandbox", sandbox, "--cd", str(cd), "--json"]
     
