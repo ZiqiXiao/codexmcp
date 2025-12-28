@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 import queue
@@ -10,9 +11,9 @@ import threading
 import time
 import uuid
 from pathlib import Path
-from typing import Annotated, Any, Dict, Generator, List, Literal, Optional
+from typing import Annotated, Any, AsyncGenerator, Dict, Generator, List, Literal, Optional
 
-from mcp.server.fastmcp import FastMCP
+from mcp.server.fastmcp import Context, FastMCP
 from pydantic import BeforeValidator, Field
 import shutil
 
@@ -104,6 +105,46 @@ def run_shell_command(cmd: list[str]) -> Generator[str, None, None]:
         except queue.Empty:
             break
 
+HEARTBEAT_INTERVAL_SECONDS = 15.0
+STREAM_BUFFER_THRESHOLD = 240
+
+async def stream_shell_command(
+    cmd: list[str],
+    ctx: Context | None,
+    heartbeat_interval: float = HEARTBEAT_INTERVAL_SECONDS,
+) -> AsyncGenerator[str, None]:
+    """Stream command output without blocking the event loop."""
+    loop = asyncio.get_running_loop()
+    output_queue: asyncio.Queue[str | None] = asyncio.Queue()
+
+    def worker() -> None:
+        for line in run_shell_command(cmd):
+            loop.call_soon_threadsafe(output_queue.put_nowait, line)
+        loop.call_soon_threadsafe(output_queue.put_nowait, None)
+
+    thread = threading.Thread(target=worker, daemon=True)
+    thread.start()
+
+    last_output_at = time.monotonic()
+    while True:
+        try:
+            line = await asyncio.wait_for(output_queue.get(), timeout=heartbeat_interval)
+        except asyncio.TimeoutError:
+            if ctx is not None:
+                idle_for = int(time.monotonic() - last_output_at)
+                message = f"Codex still running... ({idle_for}s since last output)"
+                await ctx.report_progress(0, message=message)
+                await ctx.info(message)
+            continue
+
+        if line is None:
+            break
+
+        last_output_at = time.monotonic()
+        yield line
+
+    thread.join(timeout=1)
+
 def windows_escape(prompt):
     """
     Windows 风格的字符串转义函数。
@@ -190,6 +231,7 @@ async def codex(
         str,
         "Configuration profile name to load from `~/.codex/config.toml`. This parameter is strictly prohibited unless explicitly specified by the user.",
     ] = "",
+    ctx: Context | None = None,
 ) -> Dict[str, Any]:
     """Execute a Codex CLI session and return the results."""
     # Build command as list to avoid injection
@@ -221,23 +263,39 @@ async def codex(
 
     all_messages: list[Dict[str, Any]] = []
     agent_messages = ""
+    stream_buffer = ""
     success = True
     err_message = ""
     thread_id: Optional[str] = None
 
-    for line in run_shell_command(cmd):
+    if ctx is not None:
+        await ctx.info("Starting Codex CLI...")
+
+    async for line in stream_shell_command(cmd, ctx):
         try:
             line_dict = json.loads(line.strip())
             all_messages.append(line_dict)
             item = line_dict.get("item", {})
             item_type = item.get("type", "")
             if item_type == "agent_message":
-                agent_messages = agent_messages + item.get("text", "")
+                text = item.get("text", "")
+                if text:
+                    agent_messages = agent_messages + text
+                    stream_buffer += text
+                    if ctx is not None and (
+                        len(stream_buffer) >= STREAM_BUFFER_THRESHOLD
+                        or stream_buffer.endswith("\n")
+                    ):
+                        await ctx.info(stream_buffer)
+                        stream_buffer = ""
             if line_dict.get("thread_id") is not None:
                 thread_id = line_dict.get("thread_id")
             if "fail" in line_dict.get("type", ""):
                 success = False if len(agent_messages) == 0 else success
-                err_message += "\n\n[codex error] " + line_dict.get("error", {}).get("message", "")
+                error_text = line_dict.get("error", {}).get("message", "")
+                err_message += "\n\n[codex error] " + error_text
+                if ctx is not None and error_text:
+                    await ctx.error(error_text)
             if "error" in line_dict.get("type", ""):
                 error_msg = line_dict.get("message", "")
                 import re 
@@ -246,17 +304,24 @@ async def codex(
                 if not is_reconnecting:
                     success = False if len(agent_messages) == 0 else success
                     err_message += "\n\n[codex error] " + error_msg
+                    if ctx is not None and error_msg:
+                        await ctx.error(error_msg)
                     
         except json.JSONDecodeError:
             # import sys
             # print(f"Ignored non-JSON line: {line}", file=sys.stderr)
             err_message += "\n\n[json decode error] " + line
+            if ctx is not None:
+                await ctx.warning(f"Codex emitted non-JSON output: {line}")
             continue
             
         except Exception as error:
             err_message += "\n\n[unexpected error] " + f"Unexpected error: {error}. Line: {line!r}"
             success = False
             break
+
+    if ctx is not None and stream_buffer:
+        await ctx.info(stream_buffer)
 
     if thread_id is None:
         success = False
